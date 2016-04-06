@@ -1,0 +1,223 @@
+#!/bin/bash
+
+################################################################################
+#
+# tc-made-simple
+# Author: Cristian Popa (cristian_y@users.sourceforge.net)
+# Web: http://tc-made-simple.sourceforge.net
+# Version: 0.1.1
+# Changes:
+#    - corrected some bugs: matching  ip's and ports
+#    - corrected bug: deleting root qdisc (destroy filters)
+#    - added support for iptables mark
+#
+# See tc.sample for better understanding
+#
+################################################################################
+#
+# Dimodifikasi oleh:
+# M. Haikal Kurniawan (c0neman@gmail.com)
+# Budiwijaya (budiw_1@yahoo.com)
+#
+# Support IPv4 & IPv6 - c0neman & budiw_1
+# Support monitoring  - budiw_1
+#
+# Versi 20110811-buaya
+#
+
+tctestmode="0"
+monitor=/home/budiw/tcms/monitor/
+
+################################################################################
+# Echo and execute tc command
+################################################################################
+
+function tc_exec()
+{
+    for ((a=1; a <= tcindex; a++))
+    do
+	echo -n "  "
+    done
+    if [[ "$1" == "tc qdisc"* ]]
+    then
+	echo -n "|__"
+    elif [[ "$1" == "tc filter"* ]]
+    then
+	echo -n "|__"
+    fi
+
+    echo $1
+    if [[ $tctestmode == "0" ]]
+    then
+        $1
+    fi
+}
+
+################################################################################
+# Syntax : tc_init device [test [htb]]
+# If you pass the second parameter "test" commands will only echo to screen without doing anything
+# If you pass the next parameter "htb" it will create the rooq qdisc
+################################################################################
+
+function tc_init()
+{
+    tcclass[1]=0
+    tcindex=1
+    tclast=0
+    tcdevice="$1"
+
+    if [ $2 == "test" ]; then
+	tctestmode="1"
+	shift
+    fi
+    
+    if [ $2 == "htb" ]; then
+        tc_exec "tc qdisc add dev $tcdevice root handle 10: htb default 9999"
+	tc_exec "tc class add dev $tcdevice parent 10:0 classid 10:9999 htb rate 10240Kbit"
+    fi
+    echo "%translate = (" > $monitor/tccs.$tcdevice.rc
+}
+
+################################################################################
+# Destroy the root qdisc. Call only if required to.
+################################################################################
+
+function tc_destroy()
+{
+    if [ $1 == "test" ]; then
+	tctestmode="1"
+	echo "testmode: $tctestmode"
+	shift
+    fi
+
+    tc_exec "tc qdisc del dev $1 root"
+}
+
+################################################################################
+# Within one class many other classes may exist so we need to set the environment for them.
+# Called automaticaly from tc_class.
+################################################################################
+
+function tc_subclass()
+{
+    tcindex=`expr $tcindex + 1`
+    tcclass[tcindex]=$tclast
+}
+
+################################################################################
+# After creating subclasses we need to return to the parent class.
+################################################################################
+
+function tc_declass()
+{
+    tcindex=`expr $tcindex - 1`
+}
+
+################################################################################
+# The main function which creates classes, qdiscs and applies filters to them.
+# Syntax :  device :: min rate :: max rate :: class prio :: [htb | filter prio target ... [target]]
+# Target :  s{source ip}[/mask][:sport]_d{destination ip}[/mask][:dport]
+#    or  :  s{source ip}[/mask][:sport]
+#    or  :  d{destination ip}[/mask][:dport]
+#    or  :  m{iptables mark}
+# ... without brackets, like m0x1_s192.168.0.1:100_d10.0.0.1:200
+# The root qdisc MUST BE defined
+# If source or destination (target) is specified the filter prio MUST be specified
+################################################################################
+
+function tc_class()
+{
+tclast=`expr $tclast + 1`
+
+local device="add dev $tcdevice"
+local parent="parent 10:${tcclass[tcindex]}"
+local classid="10:$tclast"
+
+tc_exec "tc class $device $parent classid $classid htb rate ${1}kbit ceil ${2}kbit prio ${3}"
+#budiw
+echo -n "        '$classid' => '" >> $monitor/tccs.$tcdevice.rc
+#budiw-end
+if [[ $4 == htb ]]; then
+    tc_subclass
+    return
+fi
+
+tc_exec "tc qdisc $device parent $classid  sfq perturb 10"
+
+local lprio=`expr $4 + 1`
+local prio6="prio $lprio"
+local prio="prio $4"
+local string=""
+local s=""
+local m1=""
+local m2=""
+local string2=""
+
+until [ -z "$5" ]
+do
+    string=$5
+
+    string=${string/_/ }
+    string2="u32"
+    for s in $string; do
+    	if [[ $s == s* ]]; then
+	    s=${s/#s/"c"}
+	    m1="src"
+	    m2="sport"
+	elif [[ $s == d* ]]; then
+	    s=${s/#d/"c"}
+	    m1="dst"
+	    m2="dport"
+	elif [[ $s == m* ]]; then
+            s=${s/#m/" match mark "}" 0xff"
+	else
+	    echo "Error in parameter: $5"
+	    shift
+	    continue
+	fi
+
+	# for IP v6
+	if [[ $s == c*:*/*:* ]]; then
+	    s=`echo $s | rev`
+	    s=${s/:/`echo " match ip6 $m2 " | rev`}
+	    s=`echo $s | rev`" 0xffff "
+	    s=${s/#c/" match ip6 $m1 "}
+	elif [[ $s == c*:*/* ]]; then
+	    s=${s/#c/" match ip6 $m1 "}
+	elif [[ $s == cv6:* ]]; then
+	    s=${s/#cv6:/" match ip6 $m2 "}" 0xffff "
+	# for IP v4
+        elif [[ $s == c*.*:* ]]; then
+	    s=${s/:/" match ip $m2 "}" 0xffff "
+	    s=${s/#c/" match ip $m1 "}
+	elif [[ $s == c:* ]]; then
+	    s=${s/#c:/" match ip $m2 "}" 0xffff "
+        elif [[ $s == c*.* ]]; then
+	    s=${s/#c/" match ip $m1 "}
+	elif [[ $s == c* ]]; then
+	    s=${s/#c/" match ip $m2 "}" 0xffff "
+	fi
+	string2="$string2 $s"
+    done
+
+    if [[ $string2 == *ip6* ]]; then
+	tc_exec "tc filter $device parent 10:0 protocol ipv6 $prio6 $string2 flowid $classid"
+    else
+	tc_exec "tc filter $device parent 10:0 protocol ip $prio $string2 flowid $classid"
+    fi
+
+    shift
+done
+}
+
+function tc_desc()
+{
+ echo "$1'," >> $monitor/tccs.$tcdevice.rc
+}
+
+function tc_desc_end()
+{
+ echo "        '10:9999' => 'default'" >> $monitor/tccs.$tcdevice.rc
+ echo ");" >> $monitor/tccs.$tcdevice.rc
+}
+
